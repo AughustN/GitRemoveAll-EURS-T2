@@ -1,9 +1,5 @@
-# onnx/ (Track 2 only; delete this folder if you entered only Track 1)
+`submitted_model.onnx` is the exact file uploaded to the leaderboard for testing-phase submission #19408
+(SHA-256 `01e5916557bd5bd3e31a0f83fd15c8a55596fce8e62b2d6493ca27fe4039df23`).
 
-Put a copy of the exact ONNX file you uploaded to the leaderboard for your reported submission here, named `submitted_model.onnx`:
-
-    onnx/submitted_model.onnx
-
-Then run `python repro_check.py . --export-onnx`: it regenerates the file with your `export_onnx.py` and reports whether it equals this copy.
-Write the file's SHA-256 (`sha256sum onnx/submitted_model.onnx`) into your factsheet. The model has at most 1.0 M parameters, so the file is
-far below GitHub's 100 MB limit for a normal file.
+`python repro_check.py . --export-onnx` regenerates it from `weights/` with `export_onnx.py`. The result has the same graph and
+differs only by float32 rounding in the BatchNorm-folded weights; see "Reproduction notes" in `METHOD.md`.

@@ -8,7 +8,7 @@ The organizers call   main(model_dir, out_onnx).   Every step between the checkp
   3. nr_post pass 2: luma unsharp mask (alpha 1.0, Gaussian sigma 1, border-normalised) on `restored_image`, and a
      constant per-class bias added to `seg_logits`.
 
-Passes 2 and 3 only append ONNX nodes (Slice/Mul/Add/Sub/Conv/Clip) after the network outputs; no weights change.
+Steps 2 and 3 only append ONNX nodes (Slice/Mul/Add/Sub/Conv/Clip) after the network outputs; no weights change.
 """
 import inspect
 import os
