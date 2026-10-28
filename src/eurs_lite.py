@@ -1,13 +1,12 @@
-"""EURS-Lite: model joint restoration + segmentation cho Track 2 (≤ 1.0M params, ≤ 12 GFLOPs).
+"""EURS-Lite: joint restoration + segmentation model for Track 2 (<= 1.0M params, <= 12 GFLOPs).
 
-Thiết kế chi tiết và lý do chọn từng phần: plan/02_ARCHITECTURE.md.
-
-Input : (1, 3, H, W) RGB float trong [0, 1], H × W tĩnh (mặc định 576 × 768; ảnh dọc xoay 90° trước khi vào).
-Output: restored_image (1, 3, H, W) trong [0, 1]; seg_logits (1, 5, H, W) logit thô
+Input : (1, 3, H, W) RGB float in [0, 1], static H x W (the submitted model uses 768 x 1024; the official harness
+        stretches every image to that size and does not rotate portrait images).
+Output: restored_image (1, 3, H, W) in [0, 1]; seg_logits (1, 5, H, W) raw logits
         (background, coral, fish, elasmobranch, other).
 
-Chỉ dùng op export ổn định sang ONNX / TensorRT: Conv, BatchNorm (gộp vào Conv khi export), ReLU / Clip,
-Sigmoid, Resize (kích thước tĩnh), Concat, Add, Mul, AvgPool, GlobalAveragePool, ReduceMean / ReduceMax.
+Only ops that export cleanly to ONNX / TensorRT are used: Conv, BatchNorm (folded into Conv at export), ReLU / Clip,
+Sigmoid, Resize (static size), Concat, Add, Mul, AvgPool, GlobalAveragePool, ReduceMean / ReduceMax.
 """
 import torch
 import torch.nn as nn
@@ -17,7 +16,7 @@ NUM_CLASSES = 5
 
 
 def up(x, size):
-    """Bilinear với kích thước tĩnh (số nguyên) – tránh Shape/Gather trong graph ONNX."""
+    """Bilinear resize to a static (integer) size, which avoids Shape/Gather in the ONNX graph."""
     return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
 
@@ -37,7 +36,7 @@ class DWSep(nn.Sequential):
 
 
 class InvertedResidual(nn.Module):
-    """MobileNetV2: 1×1 mở rộng → depthwise 3×3 → 1×1 chiếu (linear bottleneck), residual khi cùng shape."""
+    """MobileNetV2: 1×1 expand -> depthwise 3×3 -> 1×1 project (linear bottleneck), residual when shapes match."""
 
     def __init__(self, cin, cout, s, t):
         super().__init__()
@@ -52,7 +51,7 @@ class InvertedResidual(nn.Module):
         return x + y if self.res else y
 
 
-# (cout, stride, expand, repeat) cho từng stage; stem riêng
+# (cout, stride, expand, repeat) per stage; the stem is separate
 ENC_CFG = [
     [(16, 1, 1, 1)],                                  # H/2
     [(24, 2, 4, 1), (24, 1, 4, 1)],                   # H/4
@@ -86,7 +85,7 @@ class Encoder(nn.Module):
 
 
 class FPPM(nn.Module):
-    """Fast pyramid pooling (RSOS-Net / DSOS-Net): avg-pool 5×5 nối tiếp + global pool → ngữ cảnh rộng gần như miễn phí."""
+    """Fast pyramid pooling (RSOS-Net / DSOS-Net): chained 5×5 avg-pools + a global pool, wide context almost for free."""
 
     def __init__(self, cin, cout):
         super().__init__()
@@ -105,7 +104,7 @@ class FPPM(nn.Module):
 
 
 class FFM(nn.Module):
-    """Feature fusion (RSOS-Net): DW-sep gộp đa tầng + attention kênh (SE) + attention không gian (CBAM)."""
+    """Feature fusion (RSOS-Net): DW-sep fusion of several levels + channel attention (SE) + spatial attention (CBAM)."""
 
     def __init__(self, cin, cout, r=4):
         super().__init__()
@@ -121,7 +120,7 @@ class FFM(nn.Module):
 
 
 class SegHead(nn.Module):
-    """Mini-RSOS: LFPN (H/4–H/16) + FPPM (H/32) → FFM ở H/4 → tinh chỉnh với feature H/2 → logit."""
+    """Mini-RSOS: LFPN (H/4–H/16) + FPPM (H/32) -> FFM at H/4 -> refinement with the H/2 features -> logits."""
 
     def __init__(self, ch, d=64, c_ffm=96, c_out=48, n_cls=NUM_CLASSES):
         super().__init__()
@@ -131,7 +130,7 @@ class SegHead(nn.Module):
         self.ffm = FFM(4 * d, c_ffm)
         self.refine = DWSep(c_ffm + ch[0], c_out)
         self.cls = nn.Conv2d(c_out, n_cls, 1)
-        # chỉ dùng lúc train (bị bỏ khi export): deep supervision ở H/16 và head biên ở H/4
+        # training only (dropped at export): deep supervision at H/16 and an edge head at H/4
         self.aux_seg = nn.Conv2d(d, n_cls, 1)
         self.aux_edge = nn.Conv2d(c_ffm, 1, 1)
 
@@ -151,18 +150,18 @@ class SegHead(nn.Module):
 
 
 class RestoreHead(nn.Module):
-    """Trường biến đổi màu affine theo vị trí (ý tưởng HDRNet) + residual chi tiết.
+    """Spatially varying colour-affine field (as in HDRNet) + a detail residual.
 
-    Vật lý: I = J·t + B·(1 − t) ⇒ J = I/t − B(1 − t)/t, tức J là biến đổi affine của I với hệ số phụ thuộc
-    t, B (thay đổi chậm theo không gian). Head dự đoán ma trận 3×3 + bias cho từng ô ở H/16 (local) cộng
-    một phần toàn ảnh (global), nội suy lên H × W rồi áp lên ảnh input; residual nhỏ trả lại chi tiết.
+    Physics: I = J·t + B·(1 − t) => J = I/t − B(1 − t)/t, so J is an affine transform of I whose coefficients depend
+    on t and B, which vary slowly in space. The head predicts a 3×3 matrix + bias per cell at H/16 (local) plus a
+    whole-image part (global), upsamples it to H × W and applies it to the input; a small residual adds detail back.
     """
 
     def __init__(self, ch, c_mid=32, c_det=16):
         super().__init__()
         self.local = nn.Sequential(ConvBNAct(ch[3], c_mid, 1), DWSep(c_mid, c_mid), nn.Conv2d(c_mid, 12, 1))
         self.glob = nn.Sequential(nn.Conv2d(ch[4], c_mid, 1), nn.ReLU(inplace=True), nn.Conv2d(c_mid, 12, 1))
-        for m in (self.local[-1], self.glob[-1]):  # khởi tạo = biến đổi đồng nhất
+        for m in (self.local[-1], self.glob[-1]):  # initialised to the identity transform
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
         self.det_lat = ConvBNAct(ch[1], c_det, 1)
@@ -187,10 +186,11 @@ class RestoreHead(nn.Module):
 
 
 class RestoreHead2(RestoreHead):
-    """RestoreHead + nhánh ước lượng affine riêng cho restore (arch hậu tố "_r2", dùng phần params / FLOPs còn dư):
-    ctx ở H/16 (feature H/16 + H/8 pool, 2 inverted residual 64 kênh) và mid ở H/8 (feature H/8 + ctx). Conv ra của
-    2 nhánh khởi tạo 0 → lúc đầu y hệt RestoreHead (fine-tune restore-only từ checkpoint cũ, it 0 = model cũ).
-    Encoder + seg đóng băng được (train_lite --restore_only) vì nhánh mới chỉ đọc feature."""
+    """RestoreHead + extra affine branches for restoration (arch suffix "_r2", using the spare params / FLOPs):
+    ctx at H/16 (H/16 features + pooled H/8 features, 2 inverted residuals with 64 channels) and mid at H/8 (H/8
+    features + ctx). The output Convs of both branches start at zero, so at iteration 0 the model is exactly the
+    previous RestoreHead. The encoder and seg head can stay frozen (restore-only training) because the new
+    branches only read features."""
 
     def __init__(self, ch, c_mid=32, c_det=16, c_ctx=64):
         super().__init__(ch, c_mid, c_det)
@@ -210,13 +210,14 @@ class RestoreHead2(RestoreHead):
 
     def affine(self, f, sizes, hw, x=None):
         p, _, m = self._ctx_mid(f, sizes)
-        return up(p, hw) + up(m, hw)  # 2 resize riêng (không up 2 lần) → it 0 trùng tuyệt đối RestoreHead
+        return up(p, hw) + up(m, hw)  # two separate resizes (not one after another) so that iteration 0 equals RestoreHead exactly
 
 
 class RestoreHead3(RestoreHead2):
-    """RestoreHead2 + tầng affine mịn ở H/4 (arch hậu tố "_r3"): đọc feature H/4, hidden nhánh mid (H/8) và thống kê
-    màu cục bộ của input (avg pool 4×4) → hệ số affine biến thiên ở H/4 thay vì nội suy từ H/8 (t, B đổi nhanh ở biên
-    vật thể / nền vì khác khoảng cách). Conv ra khởi tạo 0 → it 0 = RestoreHead2 y hệt (restore-only từ #19085)."""
+    """RestoreHead2 + a finer affine stage at H/4 (arch suffix "_r3"). It reads the H/4 features, the hidden state of
+    the mid branch (H/8) and the local input colour (4×4 avg pool), so the affine coefficients can change at H/4
+    instead of being interpolated from H/8 (t and B change quickly at object / background edges, where the distance
+    changes). The output Conv starts at zero, so iteration 0 equals RestoreHead2 exactly."""
 
     def __init__(self, ch, c_mid=32, c_det=16, c_ctx=64, c_fine=48):
         super().__init__(ch, c_mid, c_det, c_ctx)
@@ -235,7 +236,7 @@ RESTORE_HEADS = {"": RestoreHead, "r2": RestoreHead2, "r3": RestoreHead3}
 
 
 class HSwish(nn.Module):
-    """x·relu6(x+3)/6 viết bằng Add/Clip/Mul/Div (op nằm trong vocabulary của script FLOPs chính thức)."""
+    """x·relu6(x+3)/6 written with Add/Clip/Mul/Div (ops known to the official FLOPs script)."""
 
     def forward(self, x):
         return x * torch.clamp(x + 3.0, 0.0, 6.0) / 6.0
@@ -247,22 +248,22 @@ class HSigmoid(nn.Module):
 
 
 def _swap_hard_act(module):
-    """Thay nn.Hardswish / nn.Hardsigmoid của torchvision bằng bản Clip (không có tham số → trọng số giữ nguyên)."""
+    """Replace the nn.Hardswish / nn.Hardsigmoid of torchvision by Clip versions (no parameters, so the weights are unchanged)."""
     for name, m in list(module.named_modules()):
         if isinstance(m, (nn.Hardswish, nn.Hardsigmoid)):
             parent = module.get_submodule(name.rsplit(".", 1)[0]) if "." in name else module
             setattr(parent, name.rsplit(".", 1)[-1], HSwish() if isinstance(m, nn.Hardswish) else HSigmoid())
 
 
-# MobileNetV3 torchvision: (số layer features giữ lại, index layer lấy feature ở H/2, H/4, H/8, H/16, "H/32")
-# large: cắt sau layer 12 (112 kênh, H/16) → 0.79M tham số; bỏ 3 block 160 kênh (1.4M) + conv 960.
-#        Không có H/32 → tầng cuối lặp lại H/16 (LR-ASPP gốc của torchvision cũng chạy large ở H/16 – dilated).
-# small: bỏ conv 1×1 96→576 cuối → 0.87M tham số, đủ 5 tầng tới H/32.
+# torchvision MobileNetV3: (number of feature layers kept, layer indices tapped at H/2, H/4, H/8, H/16, "H/32")
+# large: cut after layer 12 (112 channels, H/16) -> 0.79M parameters; drops the three 160-channel blocks (1.4M) + conv 960.
+#        There is no H/32, so the last tap repeats H/16 (torchvision's own LR-ASPP also runs large at H/16, dilated).
+# small: drops the final 1×1 conv 96->576 -> 0.87M parameters, all 5 levels down to H/32.
 MNV3_CFG = {"mnv3l": ("large", 13, (1, 3, 6, 12, 12)), "mnv3s": ("small", 12, (0, 1, 3, 8, 11))}
 
 
 class MNV3Encoder(nn.Module):
-    """Encoder MobileNetV3 pretrained ImageNet-1k (torchvision), chuẩn hoá ImageNet làm bên trong (Sub/Div)."""
+    """MobileNetV3 encoder, ImageNet-1k pretrained (torchvision); ImageNet normalisation is done inside (Sub/Div)."""
 
     def __init__(self, arch="mnv3l", pretrained=True):
         super().__init__()
@@ -289,8 +290,9 @@ class MNV3Encoder(nn.Module):
 
 
 class LRASPP(nn.Module):
-    """Lite R-ASPP (MobileNetV3, Howard et al. ICCV 2019): nhánh cao (H/16 hoặc H/32) 1×1 conv nhân attention
-    toàn cục, upsample về H/8 rồi cộng logit nhánh thấp (H/8). aux_seg (chỉ khi train) = logit riêng nhánh cao."""
+    """Lite R-ASPP (MobileNetV3, Howard et al. ICCV 2019): the high branch (H/16 or H/32) is a 1×1 conv times a global
+    attention, upsampled to H/8 and added to the logits of the low branch (H/8). aux_seg (training only) = the
+    high-branch logits on their own."""
 
     def __init__(self, ch, inter=128, n_cls=NUM_CLASSES, refine=0):
         super().__init__()
@@ -299,7 +301,7 @@ class LRASPP(nn.Module):
         self.low_cls = nn.Conv2d(ch[2], n_cls, 1)
         self.high_cls = nn.Conv2d(inter, n_cls, 1)
         self.refine = refine
-        if refine:  # tinh chỉnh logit ở H/4 bằng feature H/4 (biên vật thể); conv cuối khởi tạo 0 → lúc đầu = LR-ASPP
+        if refine:  # refine the logits at H/4 with H/4 features (object edges); the last conv starts at zero, so it starts as LR-ASPP
             self.ref_lat = ConvBNAct(ch[1], refine // 2, 1)
             self.ref = nn.Sequential(DWSep(refine // 2 + n_cls, refine), DWSep(refine, refine), nn.Conv2d(refine, n_cls, 1))
             nn.init.zeros_(self.ref[-1].weight)
@@ -317,7 +319,7 @@ class LRASPP(nn.Module):
         return logits
 
     def full(self, f, sizes, hw, train_aux=False):
-        """Logit ở độ phân giải input (= đường cũ: up(forward(...), hw))."""
+        """Logits at input resolution (same as before: up(forward(...), hw))."""
         if train_aux:
             logits, hi, edge = self.forward(f, sizes, True)
             return up(logits, hw), hi, edge
@@ -325,10 +327,11 @@ class LRASPP(nn.Module):
 
 
 class LRASPP2(LRASPP):
-    """LR-ASPP + decoder phụ (cờ arch "s2", dùng phần params / FLOPs còn dư – head seg gốc chỉ 30K tham số, 0.11 GF):
-    FPN nhẹ H/16 → H/8 → H/4 (feature H/16 + H/8 + H/4 và logit LR-ASPP) ra phần cộng thêm cho logit ở H/4 (biên,
-    vật thể nhỏ). Conv ra khởi tạo 0 + resize riêng từng nhánh → it 0 trùng tuyệt đối LR-ASPP (fine-tune seg-only
-    từ checkpoint cũ: train_lite --seg_only, encoder + restore đóng băng)."""
+    """LR-ASPP + an extra decoder (arch flag "s2", using the spare params / FLOPs; the plain seg head has only 30K
+    parameters, 0.11 GF): a light FPN H/16 -> H/8 -> H/4 (H/16 + H/8 + H/4 features and the LR-ASPP logits) adds a
+    correction to the logits at H/4 (edges, small objects). Zero-initialised output Conv + separate resizes per
+    branch, so iteration 0 equals LR-ASPP exactly (seg-only fine-tuning with encoder and restoration frozen).
+    Not used in the submitted model."""
 
     def __init__(self, ch, inter=128, n_cls=NUM_CLASSES, c=64):
         super().__init__(ch, inter, n_cls)
@@ -345,44 +348,43 @@ class LRASPP2(LRASPP):
         logits, hi, _ = LRASPP.forward(self, f, sizes, True)                       # H/8
         d = self.fuse8(self.lat8(f[2]) + up(self.lat16(f[4]), sizes[2]))
         d = self.fuse4(torch.cat([up(d, sizes[1]), self.lat4(f[1]), up(logits, sizes[1])], 1))
-        out = up(logits, hw) + up(self.out(d), hw)  # 2 resize riêng → it 0 = LR-ASPP
+        out = up(logits, hw) + up(self.out(d), hw)  # two separate resizes -> iteration 0 = LR-ASPP
         return (out, hi, None) if train_aux else out
 
 
 class EURSLite(nn.Module):
-    """hw: kích thước tĩnh dùng khi export (số nguyên cố định trong graph). dynamic=True: lấy kích thước từ
-    input lúc chạy (dùng khi train / suy luận PyTorch với nhiều kích thước); export phải đặt dynamic=False.
+    """hw: static size used at export (fixed integers in the graph). dynamic=True takes the size from the input at
+    run time (training / PyTorch inference at several sizes); export needs dynamic=False.
 
-    arch: "lite" = encoder MobileNetV2 tự thiết kế train từ đầu + SegHead mini-RSOS (bản F9 cũ);
-          "mnv3l" / "mnv3s" = MobileNetV3 large / small pretrained ImageNet + LR-ASPP (công thức top Track 2:
-          encoder MobileNet ImageNet + LR-ASPP + restore affine theo ô, distill từ teacher DINOv3 – train_lite --teacher);
-          "mnv3lr" = mnv3l + nhánh refine logit ở H/4 (LR-ASPP gốc ra logit H/8).
-          Hậu tố "_r2" (vd "mnv3l_r2"): RestoreHead2 (thêm nhánh ước lượng affine riêng cho restore).
-          Hậu tố "_r3" (vd "mnv3l_r3"): RestoreHead3 (= r2 + tầng affine mịn ở H/4).
-          Hậu tố "_s2" (vd "mnv3l_r2_s2"): LRASPP2 (thêm decoder phụ ra logit H/4 cho seg).
+    arch: "lite" = our own MobileNetV2-style encoder trained from scratch + mini-RSOS SegHead (early version);
+          "mnv3l" / "mnv3s" = ImageNet MobileNetV3 large / small + LR-ASPP, distilled from the DINOv3 teacher;
+          "mnv3lr" = mnv3l + a logit refinement branch at H/4 (plain LR-ASPP outputs logits at H/8).
+          Suffix "_r2" (e.g. "mnv3l_r2"): RestoreHead2 (extra affine branches for restoration).
+          Suffix "_r3" (e.g. "mnv3l_r3"): RestoreHead3 (= r2 + a finer affine stage at H/4). The submitted model is "mnv3l_r3".
+          Suffix "_s2" (e.g. "mnv3l_r2_s2"): LRASPP2 (extra seg decoder with logits at H/4).
     """
 
     def __init__(self, hw=(576, 768), enc_cfg=ENC_CFG, seg_d=64, seg_ffm=96, seg_out=48, dynamic=False, arch="lite",
                  pretrained=True):
         super().__init__()
-        assert hw[0] % 32 == 0 and hw[1] % 32 == 0, "H, W phải chia hết cho 32"
+        assert hw[0] % 32 == 0 and hw[1] % 32 == 0, "H and W must be multiples of 32"
         self.hw, self.dynamic, self.arch = tuple(hw), dynamic, arch
         base, *flags = arch.split("_")
-        assert set(flags) <= {"r2", "r3", "s2"}, f"cờ arch lạ: {flags}"
+        assert set(flags) <= {"r2", "r3", "s2"}, f"unknown arch flags: {flags}"
         if base == "lite":
             self.encoder = Encoder(enc_cfg)
             ch = self.encoder.channels
             self.seg = SegHead(ch, seg_d, seg_ffm, seg_out)
-        else:  # "mnv3lr" = mnv3l + refine logit ở H/4 (dùng phần FLOPs còn dư dưới 12 G)
+        else:  # "mnv3lr" = mnv3l + logit refinement at H/4 (uses spare FLOPs under 12 G)
             refine = 64 if base.endswith("r") else 0
             self.encoder = MNV3Encoder(base[:-1] if refine else base, pretrained)
             ch = self.encoder.channels
-            assert not ("s2" in flags and refine), "s2 không đi cùng mnv3lr"
+            assert not ("s2" in flags and refine), "s2 cannot be combined with mnv3lr"
             self.seg = LRASPP2(ch) if "s2" in flags else LRASPP(ch, refine=refine)
         self.restore = RESTORE_HEADS[next((k for k in ("r3", "r2") if k in flags), "")](ch)
 
     def aux_parameters(self):
-        """Tham số chỉ dùng lúc train (không vào graph ONNX)."""
+        """Parameters used only in training (not in the ONNX graph)."""
         return [p for n, p in self.seg.named_parameters() if n.startswith(("aux_seg.", "aux_edge."))]
 
     def _sizes(self, x):
